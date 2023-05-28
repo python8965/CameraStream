@@ -5,16 +5,22 @@ import android.content.ContentValues.TAG
 import android.content.Context
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
+import android.os.Build
 import android.os.Bundle
+import android.os.ParcelFileDescriptor
 import android.provider.MediaStore
 import android.util.Log
+import android.util.Size
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.annotation.RequiresApi
 import androidx.camera.core.CameraSelector
+import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageCapture
 import androidx.camera.core.Preview
 import androidx.camera.core.UseCase
 import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.camera.video.FileDescriptorOutputOptions
 import androidx.camera.video.MediaStoreOutputOptions
 import androidx.camera.video.Recorder
 import androidx.camera.video.Recording
@@ -43,20 +49,21 @@ import com.aketon.camerastream.ui.theme.CameraStreamTheme
 import com.google.accompanist.permissions.ExperimentalPermissionsApi
 import com.google.accompanist.permissions.PermissionRequired
 import com.google.accompanist.permissions.rememberPermissionState
+import com.google.common.util.concurrent.ListenableFuture
+import java.io.FileDescriptor
 import java.net.InetAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.util.concurrent.Executor
+import java.util.concurrent.Executors
 
 
 class MainActivity : ComponentActivity() {
-    private var imageCapture: ImageCapture? = null
+    private var recordingExecutor: Executor = Executors.newSingleThreadExecutor()
+    private lateinit var cameraProviderFuture: ListenableFuture<ProcessCameraProvider>
+    var previewUseCase: UseCase? = null
 
-    private var videoCapture: VideoCapture<Recorder>? = null
-    private var recording: Recording? = null
-
-    private lateinit var previewView: PreviewView
-
+    @RequiresApi(Build.VERSION_CODES.O)
     @OptIn(ExperimentalPermissionsApi::class)
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -67,7 +74,9 @@ class MainActivity : ComponentActivity() {
                 permission = CAMERA,
             )
 
+            val context = LocalContext.current
 
+            cameraProviderFuture = remember { ProcessCameraProvider.getInstance(context) }
 
             LaunchedEffect(Unit) {
                 cameraPermissionState.launchPermissionRequest()
@@ -77,7 +86,10 @@ class MainActivity : ComponentActivity() {
             CameraStreamTheme {
 
                 // A surface container using the 'background' color from the theme
-                Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
+                Surface(
+                    modifier = Modifier.fillMaxSize(),
+                    color = MaterialTheme.colorScheme.background
+                ) {
                     PermissionRequired(
                         permissionState = cameraPermissionState,
                         permissionNotGrantedContent = { Greeting("Permission not granted") },
@@ -87,9 +99,6 @@ class MainActivity : ComponentActivity() {
                         FindServer()
                     }
 
-
-
-
                 }
             }
         }
@@ -98,14 +107,9 @@ class MainActivity : ComponentActivity() {
     @Composable
     fun SimpleCameraPreview() {
         val lifecycleOwner = LocalLifecycleOwner.current
-        val context = LocalContext.current
-        val cameraProviderFuture = remember { ProcessCameraProvider.getInstance(context) }
 
-        val videoListener = Consumer<VideoRecordEvent> { videoEvent ->
-            videoEvent.outputOptions.location?.let { uri ->
-                Log.d(TAG, "Video saved to: $uri")
-            }
-        }
+
+
 
         AndroidView(
             factory = { ctx ->
@@ -113,23 +117,9 @@ class MainActivity : ComponentActivity() {
                 val executor = ContextCompat.getMainExecutor(ctx)
 
                 cameraProviderFuture.addListener({
-                    val videoCapture = VideoCapture.withOutput(Recorder.Builder().build().also { recorder ->
-                        val mediaStore: MediaStoreOutputOptions = MediaStoreOutputOptions.Builder(
-                            contentResolver,
-                            MediaStore.Video.Media.EXTERNAL_CONTENT_URI
-                        ).build()
-
-                        val recoding = recorder.prepareRecording(context, mediaStore)
-
-                        val recording = runCatching { recoding.start(Executor {  }, videoListener) }.onSuccess {
-                            Log.d(TAG, "Recording started")
-                        }.onFailure { error ->
-                            Log.e(TAG, "Recording failed to start", error)
-                        }
-                    })
 
                     val cameraProvider = cameraProviderFuture.get()
-                    val preview = Preview.Builder().build().also {
+                    previewUseCase = Preview.Builder().build().also {
                         it.setSurfaceProvider(previewView.surfaceProvider)
                     }
 
@@ -140,14 +130,119 @@ class MainActivity : ComponentActivity() {
                     cameraProvider.bindToLifecycle(
                         lifecycleOwner,
                         cameraSelector,
-                        preview,
-                        videoCapture
+                        previewUseCase
                     )
                 }, executor)
                 previewView
             },
             modifier = Modifier.fillMaxSize(),
         )
+    }
+
+    @Composable
+    @RequiresApi(Build.VERSION_CODES.O)
+    @androidx.annotation.OptIn(androidx.camera.core.ExperimentalGetImage::class)
+    fun FindServer() {
+        Log.e(TAG, "FindServer")
+        val isConnected = remember { mutableStateOf(false) }
+
+
+        val context = LocalContext.current
+        val lifecycleOwner = LocalLifecycleOwner.current
+        val nsdManager = getSystemService(context, NsdManager::class.java) as NsdManager
+        val executor = ContextCompat.getMainExecutor(context)
+
+        val serverSocket = ServerSocket(0)
+
+        fun connected(serviceInfo: NsdServiceInfo) {
+            val cameraProvider = cameraProviderFuture.get()
+
+            Log.i(TAG, "try connecting")
+
+            val socket = serverSocket.accept()
+
+            Log.i(TAG, "accepted connection from ${socket.inetAddress.hostAddress}")
+
+            cameraProviderFuture.addListener({
+                cameraProvider.unbindAll()
+
+                val cameraSelector = CameraSelector.Builder()
+                    .build()
+
+                val imageAnalysis = ImageAnalysis.Builder()
+                    // enable the following line if RGBA output is needed.
+                    // .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
+                    .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                    .build()
+
+                imageAnalysis.setAnalyzer(executor, ImageAnalysis.Analyzer { imageProxy ->
+                    Log.i(TAG, imageProxy.toBitmap().run {
+                        val array : IntArray = IntArray(100)
+                        getPixels(array, 0,10,0,0,10,10)
+
+                        socket.getOutputStream().write(array.fold(ArrayList<Byte>()){ acc, i->
+                            acc.add(((i and 0xff).toByte()))
+                            acc
+                        }.toByteArray())
+
+                        Log.i(TAG, "wrote ${array.size} bytes")
+
+                        array.toString()
+                    })
+
+
+                    // insert your code here.
+                    // after done, release the ImageProxy object
+                    imageProxy.close()
+                })
+
+                val parcelFileDescriptor = ParcelFileDescriptor.fromSocket(socket)
+
+                cameraProvider.bindToLifecycle(
+                    lifecycleOwner,
+                    cameraSelector,
+                    imageAnalysis,
+                    previewUseCase
+                )
+            }, executor)
+        }
+
+        val registerListener = object: NsdManager.RegistrationListener{
+            override fun onRegistrationFailed(p0: NsdServiceInfo?, p1: Int) {
+                Log.e(TAG, "onRegistrationFailed")
+            }
+
+            override fun onUnregistrationFailed(p0: NsdServiceInfo?, p1: Int) {
+                Log.e(TAG, "onUnregistrationFailed")
+            }
+
+            override fun onServiceRegistered(serviceInfo: NsdServiceInfo) {
+                Log.i(TAG, "onServiceRegistered")
+                connected(serviceInfo)
+            }
+
+            override fun onServiceUnregistered(p0: NsdServiceInfo) {
+                Log.i(TAG, "onServiceUnregistered")
+            }
+
+        }
+
+
+
+        val mLocalPort = serverSocket.localPort
+
+        nsdManager.registerService(
+            NsdServiceInfo().apply {
+                serviceName = "CameraStream"
+                serviceType = "_camerastream._tcp"
+                port = mLocalPort
+            },
+            NsdManager.PROTOCOL_DNS_SD,
+            registerListener
+        )
+
+        Log.i(TAG, "server opened with port $mLocalPort")
+
     }
 }
 
@@ -158,84 +253,4 @@ fun Greeting(name: String, modifier: Modifier = Modifier) {
         text = "Hello $name!",
         modifier = modifier
     )
-}
-
-@Composable
-fun FindServer() {
-    Log.e(TAG, "FindServer")
-    val isConnected = remember { mutableStateOf(false) }
-
-    val context = LocalContext.current
-    val nsdManager = getSystemService(context, NsdManager::class.java) as NsdManager
-
-
-    val resolveListener = object : NsdManager.ResolveListener {
-
-        override fun onResolveFailed(serviceInfo: NsdServiceInfo, errorCode: Int) {
-            // Called when the resolve fails. Use the error code to debug.
-            Log.e(TAG, "Resolve failed: $errorCode")
-        }
-
-        override fun onServiceResolved(serviceInfo: NsdServiceInfo) {
-            Log.e(TAG, "Resolve Succeeded. $serviceInfo")
-
-            val port: Int = serviceInfo.port
-            val host: InetAddress = serviceInfo.host
-            Log.e(TAG, "port: $port")
-
-            Socket(host, port)
-
-            //TODO : Video stream
-
-        }
-    }
-    // Instantiate a new DiscoveryListener
-    val discoveryListener = object : NsdManager.DiscoveryListener {
-
-        // Called as soon as service discovery begins.
-        override fun onDiscoveryStarted(regType: String) {
-            Log.d(TAG, "Service discovery started")
-        }
-
-        override fun onServiceFound(service: NsdServiceInfo) {
-            // A service was found! Do something with it.
-            Log.d(TAG, "Service discovery success$service")
-
-            when {
-
-                service.serviceType != "_camerastream._tcp."-> // Service type is the string containing the protocol and
-                    // transport layer for this service.
-                    Log.d(TAG, "Unknown Service Type: ${service.serviceType}")
-                service.serviceName.contains("NsdChat") -> nsdManager.resolveService(service, resolveListener)
-            }
-        }
-
-        override fun onServiceLost(service: NsdServiceInfo) {
-            // When the network service is no longer available.
-            // Internal bookkeeping code goes here.
-            Log.e(TAG, "service lost: $service")
-        }
-
-        override fun onDiscoveryStopped(serviceType: String) {
-            Log.i(TAG, "Discovery stopped: $serviceType")
-        }
-
-        override fun onStartDiscoveryFailed(serviceType: String, errorCode: Int) {
-            Log.e(TAG, "Discovery failed: Error code:$errorCode")
-            nsdManager.stopServiceDiscovery(this)
-        }
-
-        override fun onStopDiscoveryFailed(serviceType: String, errorCode: Int) {
-            Log.e(TAG, "Discovery failed: Error code:$errorCode")
-            nsdManager.stopServiceDiscovery(this)
-        }
-    }
-
-    if (!isConnected.value) {
-        nsdManager.discoverServices(
-            "_camerastream._tcp", NsdManager.PROTOCOL_DNS_SD, discoveryListener
-        )
-    } else {
-        nsdManager.stopServiceDiscovery(discoveryListener)
-    }
 }
